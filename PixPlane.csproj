@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>PixPlane</AssemblyName>
+    <RootNamespace>PixPlane</RootNamespace>
+    <Authors>Jan Wrage</Authors>
+    <Description>Host-side streamer for the verpixeld ICND1065L panel: BGRA frame → bit-plane pack → paced UDP. No UI or graphics dependency.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/Jan1503/pixplane</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+
+</Project>
