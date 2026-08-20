@@ -62,6 +62,22 @@ public static class PanelDiscovery
         catch { /* panel may drop the second request while leaving test mode */ }
     }
 
+    /// <summary>GET <c>/status</c> from a known panel. Returns null if it does not answer.</summary>
+    public static async Task<PanelAnnouncement?> QueryStatusAsync(string host, int webPort = DefaultWebPort,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(host)) return null;
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromMilliseconds(800) };
+            using var resp = await http.GetAsync($"http://{host}:{webPort}/status", ct).ConfigureAwait(false);
+            if (!resp.IsSuccessStatusCode) return null;
+            var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            return TryParseStatusJson(body, host, "http", out var p) ? p : null;
+        }
+        catch { return null; }
+    }
+
     public static async Task<IReadOnlyList<PanelAnnouncement>> ScanAsync(
         TimeSpan? timeout = null, bool httpFallback = true, CancellationToken ct = default)
     {

@@ -11,7 +11,7 @@ Used by [verpixeld](https://github.com/jan1503) and [DeskCast](https://github.co
 | Type | Role |
 |------|------|
 | `PanelStreamer` | BGRA 256×128 → ICND bit-planes → paced UDP (default port 7777) |
-| `PanelControl` | HTTP `/cmd` on the panel web UI (colour mode 8/14, save, reboot) |
+| `PanelControl` | HTTP `/cmd` on the panel web UI (`livemode` live 8/14, or save+reboot) |
 | `PanelDiscovery` | UDP 7778 probe (`VPXD`) plus HTTP `/status` fallback |
 | `PanelColorSettings` | Live gamma / contrast / brightness / white-balance LUT |
 | `SeamColumn` | Per-column gain/lift for the four scan-home boundaries |
@@ -20,7 +20,7 @@ No UI or graphics dependency. Target framework: `net10.0`.
 
 ## Protocol
 
-Datagram v2 (firmware 1.5+): `[frameId:1][fragIdx:1][nThis:1][flags:1]` + chunk (max 1440 bytes). Fragment n maps to `buf16` offset `n * 1440`. Flags: `0x01` keyframe (all slots), `0x02` commit (last packet of this frame). Unchanged frames are skipped; otherwise only dirty slots are sent, with a keyframe at least every second. Host and panel must be updated together. Colour depth is 8 / 10 / 13 / 14 bit-planes and must match the firmware.
+Datagram v2 (firmware 1.5+): `[frameId:1][fragIdx:1][nThis:1][flags:1]` + chunk (max 1440 bytes). Fragment n maps to `buf16` offset `n * 1440`. Flags: `0x01` keyframe (all slots), `0x02` commit (last packet of this frame). Unchanged frames are skipped; otherwise only dirty slots are sent, with a keyframe at least every second. Host and panel must be updated together. Colour depth is 8 / 10 / 13 / 14 bit-planes and must match the firmware. Firmware 1.7+ can switch 8/14 live via `livemode` (no reboot).
 
 ## Usage
 
