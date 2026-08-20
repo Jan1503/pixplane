@@ -8,7 +8,11 @@ namespace PixPlane;
 ///     Streams frames to the RP2350 + W6300 "pioq" receiver over UDP. Packs the exact panel bit-plane
 ///     buffer (buf16, geometry baked in), fragments it and PACES the send to a target bitrate just below
 ///     the MCU's drain rate. Feed a top-down BGRA frame (256x128); no graphics-library dependency.
-///     Datagram: [frameId:1][fragIdx:1][nFrags:1] + chunk(&lt;=1440); fragment n -&gt; buf16 offset n*1440.
+///     Datagram v2: [frameId:1][fragIdx:1][nThis:1][flags:1] + chunk(&lt;=1440).
+///     flags: 0x01 keyframe (all fragments), 0x02 commit (last packet of this frame).
+///     Unchanged frames are skipped; otherwise only dirty 1440-byte slots are sent, with a keyframe
+///     at least every second (or when more than half the slots changed). Full (key) frames are paced
+///     only by TargetMbps — no extra inter-frame gap, that crushed fps on video.
 ///     Geometry: landscape 256x128 -&gt; stacked 128x256 (rot_cw + flip_x + flip_y), 4 data groups.
 ///     Colour + seam are live-adjustable (UpdateColor / UpdateSeam).
 /// </summary>
@@ -34,7 +38,12 @@ public sealed class PanelStreamer : IDisposable
     private readonly int _buf16Bytes;
 
     private readonly int[] _cellOff;
+    private readonly byte[] _prev;
+    private readonly byte[] _dirty;
     private readonly byte[] _dg;
+    private bool _havePrev;
+    private bool _dirtySinceKey;
+    private double _lastKeySec = -1e9;
     private readonly byte[] _gbase;
 
     private readonly string _host;
@@ -83,7 +92,9 @@ public sealed class PanelStreamer : IDisposable
         _nFrags = (_buf16Bytes + Chunk - 1) / Chunk;
         if (_nFrags > 255)
             throw new InvalidOperationException("too many fragments for a 1-byte count");
-        _dg = new byte[3 + Chunk];
+        _dg = new byte[4 + Chunk];
+        _prev = new byte[_buf16Bytes];
+        _dirty = new byte[_nFrags];
 
         _cellOff = new int[Width * Height];
         _gbase = new byte[Width * Height];
@@ -310,34 +321,82 @@ public sealed class PanelStreamer : IDisposable
             }
         }
 
-        SendPaced();
+        SendPacked();
     }
 
-    private void SendPaced()
+    private const byte FlagKey = 0x01;
+    private const byte FlagCommit = 0x02;
+    private const double KeyframeSec = 1.0;
+
+    private void SendPacked()
+    {
+        var now = _sw.Elapsed.TotalSeconds;
+        var nChanged = _nFrags;
+        if (_havePrev)
+        {
+            nChanged = 0;
+            for (var fi = 0; fi < _nFrags; fi++)
+            {
+                var off = fi * Chunk;
+                var len = Math.Min(Chunk, _buf16Bytes - off);
+                var changed = !_buf16.AsSpan(off, len).SequenceEqual(_prev.AsSpan(off, len));
+                _dirty[fi] = (byte)(changed ? 1 : 0);
+                if (changed) nChanged++;
+            }
+        }
+
+        var dueKey = !_havePrev || now - _lastKeySec >= KeyframeSec;
+        if (nChanged == 0)
+        {
+            if (!dueKey || !_dirtySinceKey) return;
+        }
+
+        var key = !_havePrev || dueKey || nChanged * 2 >= _nFrags || nChanged == 0;
+        var nThis = key ? _nFrags : nChanged;
+
+        SendPaced(key, nThis);
+        Buffer.BlockCopy(_buf16, 0, _prev, 0, _buf16Bytes);
+        _havePrev = true;
+        if (key)
+        {
+            _lastKeySec = _sw.Elapsed.TotalSeconds;
+            _dirtySinceKey = false;
+        }
+        else
+        {
+            _dirtySinceKey = true;
+        }
+    }
+
+    private void SendPaced(bool key, int nThis)
     {
         var id = _frameId++;
         var frameStart = _sw.Elapsed.TotalSeconds;
         long frameBytes = 0;
         var dg = _dg;
+        var sent = 0;
 
         for (var fi = 0; fi < _nFrags; fi++)
         {
+            if (!key && _dirty[fi] == 0) continue;
+            sent++;
             var off = fi * Chunk;
             var len = Math.Min(Chunk, _buf16Bytes - off);
             dg[0] = id;
             dg[1] = (byte)fi;
-            dg[2] = (byte)_nFrags;
-            Buffer.BlockCopy(_buf16, off, dg, 3, len);
+            dg[2] = (byte)nThis;
+            dg[3] = (byte)((key ? FlagKey : 0) | (sent == nThis ? FlagCommit : 0));
+            Buffer.BlockCopy(_buf16, off, dg, 4, len);
             try
             {
-                _sock.Send(dg, 0, 3 + len, SocketFlags.None);
+                _sock.Send(dg, 0, 4 + len, SocketFlags.None);
             }
             catch (SocketException)
             {
                 return;
             }
 
-            frameBytes += 3 + len;
+            frameBytes += 4 + len;
             var deadline = frameStart + frameBytes * 8.0 / _bps;
             var wait = deadline - _sw.Elapsed.TotalSeconds;
             if (wait > 0.0005)

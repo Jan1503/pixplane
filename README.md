@@ -20,7 +20,7 @@ No UI or graphics dependency. Target framework: `net10.0`.
 
 ## Protocol
 
-Datagram: `[frameId:1][fragIdx:1][nFrags:1]` + chunk (≤1440 bytes). Fragment *n* maps to `buf16` offset `n * 1440`. Geometry is the firmware's landscape 256×128 → stacked 128×256 packing. Colour depth is 8 / 10 / 13 / 14 bit-planes and must match the firmware `gclk` / `HUB_NPLANES` setting.
+Datagram v2 (firmware 1.5+): `[frameId:1][fragIdx:1][nThis:1][flags:1]` + chunk (max 1440 bytes). Fragment n maps to `buf16` offset `n * 1440`. Flags: `0x01` keyframe (all slots), `0x02` commit (last packet of this frame). Unchanged frames are skipped; otherwise only dirty slots are sent, with a keyframe at least every second. Host and panel must be updated together. Colour depth is 8 / 10 / 13 / 14 bit-planes and must match the firmware.
 
 ## Usage
 
