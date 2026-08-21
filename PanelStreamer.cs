@@ -62,9 +62,11 @@ public sealed class PanelStreamer : IDisposable
     // Colour LUT (8-bit in -> nPlanes-bit out) rebuilt on UpdateColor.
     private ushort[] _lutR = new ushort[256];
 
-    // Per-column seam gain (Q8) + lift (absolute), rebuilt on UpdateSeam.
+    // Per-column seam gain (Q8) + lift (absolute) + optional 8-bit remap, rebuilt on UpdateSeam.
     private int[] _seamGainR, _seamGainG, _seamGainB;
     private int[] _seamLiftR, _seamLiftG, _seamLiftB;
+    private byte[]?[] _seamMapR, _seamMapG, _seamMapB;
+    private volatile bool _seamMapsOn;
     private ushort[] _stepB = new ushort[256];
 
     private ushort[] _stepG = new ushort[256];
@@ -112,6 +114,9 @@ public sealed class PanelStreamer : IDisposable
         _seamLiftR = new int[Width];
         _seamLiftG = new int[Width];
         _seamLiftB = new int[Width];
+        _seamMapR = new byte[]?[Width];
+        _seamMapG = new byte[]?[Width];
+        _seamMapB = new byte[]?[Width];
 
         UpdateColor(opt.Color ?? new PanelColorSettings());
         UpdateSeam(opt.Seam ?? []);
@@ -183,6 +188,10 @@ public sealed class PanelStreamer : IDisposable
         var lr = new int[Width];
         var lg = new int[Width];
         var lb = new int[Width];
+        var mr = new byte[]?[Width];
+        var mg = new byte[]?[Width];
+        var mb = new byte[]?[Width];
+        var mapsOn = false;
         foreach (var s in seam)
         {
             if (s.X < 0 || s.X >= Width) continue;
@@ -192,6 +201,11 @@ public sealed class PanelStreamer : IDisposable
             lr[s.X] = LiftAbs(s.LiftR);
             lg[s.X] = LiftAbs(s.LiftG);
             lb[s.X] = LiftAbs(s.LiftB);
+            var maps = s.BuildMaps();
+            mr[s.X] = maps.R;
+            mg[s.X] = maps.G;
+            mb[s.X] = maps.B;
+            if (maps.R != null || maps.G != null || maps.B != null) mapsOn = true;
         }
 
         _seamGainR = gr;
@@ -200,6 +214,10 @@ public sealed class PanelStreamer : IDisposable
         _seamLiftR = lr;
         _seamLiftG = lg;
         _seamLiftB = lb;
+        _seamMapR = mr;
+        _seamMapG = mg;
+        _seamMapB = mb;
+        _seamMapsOn = mapsOn;
     }
 
     private static int GainQ8(double gain)
@@ -264,6 +282,10 @@ public sealed class PanelStreamer : IDisposable
         var liftR = _seamLiftR;
         var liftG = _seamLiftG;
         var liftB = _seamLiftB;
+        var mapR = _seamMapR;
+        var mapG = _seamMapG;
+        var mapB = _seamMapB;
+        var mapsOn = _seamMapsOn;
         var swap = _swapRedBlue;
         var dither = _dither;
         var nPlanes = _nPlanes;
@@ -282,6 +304,16 @@ public sealed class PanelStreamer : IDisposable
                 int g8 = bgra[o + 1];
                 int r8 = bgra[o + 2];
                 if (swap) (r8, b8) = (b8, r8);
+
+                if (mapsOn)
+                {
+                    var rm = mapR[x];
+                    if (rm != null) r8 = rm[r8];
+                    var gm = mapG[x];
+                    if (gm != null) g8 = gm[g8];
+                    var bm = mapB[x];
+                    if (bm != null) b8 = bm[b8];
+                }
 
                 int r = lutR[r8], g = lutG[g8], b = lutB[b8];
 
