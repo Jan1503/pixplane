@@ -53,7 +53,7 @@ Matching is done with a **host-generated grey fill** (verpixeld Settings → Sea
 <!-- PHOTO seam-uncorrected: grey ramp, four mismatched columns at 63/127/191/255 -->
 <!-- PHOTO seam-corrected: same frame after the 9-point curve -->
 
-UI and JSON live in the hosts: [verpixeld](https://github.com/Jan1503/verpixeld) (`seam_correction.json`, `/api/settings/seam`) and [DeskCast](https://github.com/Jan1503/deskcast) (Seam window).
+UI and JSON live in the hosts: [verpixeld](https://github.com/Jan1503/verpixeld) (`seam_correction.json` with separate 8- and 14-bit profiles, `/api/settings/seam`) and [DeskCast](https://github.com/Jan1503/deskcast) (single-curve Seam window).
 
 ## Live 8/14-bit colour depth
 
