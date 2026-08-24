@@ -18,6 +18,16 @@ Used by [verpixeld](https://github.com/Jan1503/verpixeld) and [DeskCast](https:/
 
 No UI or graphics dependency. Target framework: `net10.0`.
 
+## What's new
+
+Dated from the public GitHub history. Newest first.
+
+### 2026-08-24 — High-motion stays dirty-delta
+
+A frame with more than half the 1440-byte slots dirty used to force a **full keyframe**, which doubled 14-bit video bitrate and crushed FPS. Keys are now the **first frame** and then **at most once per second** for UDP loss recovery. High-motion video stays deltas. Large dirty bursts are padded to a full `buf16` slot so send cadence stays even (20 ms then 90 ms gaps were worse than a steady full-slot rate).
+
+Decision logic lives in `PackedSendPolicy` (unit-tested from verpixeld).
+
 ## Protocol
 
 Datagram v2 (firmware 1.5+): `[frameId:1][fragIdx:1][nThis:1][flags:1]` + chunk (max 1440 bytes). Fragment n maps to `buf16` offset `n * 1440`. Flags: `0x01` keyframe (all slots), `0x02` commit (last packet of this frame). Unchanged frames are skipped; otherwise only dirty slots are sent, with a keyframe at least every second for loss recovery (high-motion frames stay deltas). Host and panel must be updated together. Colour depth is 8 / 10 / 13 / 14 bit-planes and must match the firmware. Firmware 1.7+ can switch 8/14 live via `livemode` (no reboot).
