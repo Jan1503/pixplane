@@ -20,7 +20,7 @@ No UI or graphics dependency. Target framework: `net10.0`.
 
 ## Protocol
 
-Datagram v2 (firmware 1.5+): `[frameId:1][fragIdx:1][nThis:1][flags:1]` + chunk (max 1440 bytes). Fragment n maps to `buf16` offset `n * 1440`. Flags: `0x01` keyframe (all slots), `0x02` commit (last packet of this frame). Unchanged frames are skipped; otherwise only dirty slots are sent, with a keyframe at least every second. Host and panel must be updated together. Colour depth is 8 / 10 / 13 / 14 bit-planes and must match the firmware. Firmware 1.7+ can switch 8/14 live via `livemode` (no reboot).
+Datagram v2 (firmware 1.5+): `[frameId:1][fragIdx:1][nThis:1][flags:1]` + chunk (max 1440 bytes). Fragment n maps to `buf16` offset `n * 1440`. Flags: `0x01` keyframe (all slots), `0x02` commit (last packet of this frame). Unchanged frames are skipped; otherwise only dirty slots are sent, with a keyframe at least every second for loss recovery (high-motion frames stay deltas). Host and panel must be updated together. Colour depth is 8 / 10 / 13 / 14 bit-planes and must match the firmware. Firmware 1.7+ can switch 8/14 live via `livemode` (no reboot).
 
 ## Scan-home seam correction
 
@@ -120,6 +120,7 @@ VS project references resolve `obj\Debug\net10.0\ref\PixPlane.dll` — build **D
 
 ```
 PixPlane.csproj          Library
+PackedSendPolicy.cs      Key vs dirty-delta decision (first frame + 1s recovery keys)
 PanelStreamer.cs         Bit-plane pack + paced UDP + seam remap
 PanelControl.cs          HTTP /cmd (livemode / mode+reboot)
 PanelDiscovery.cs        UDP 7778 + HTTP /status

@@ -10,9 +10,10 @@ namespace PixPlane;
 ///     the MCU's drain rate. Feed a top-down BGRA frame (256x128); no graphics-library dependency.
 ///     Datagram v2: [frameId:1][fragIdx:1][nThis:1][flags:1] + chunk(&lt;=1440).
 ///     flags: 0x01 keyframe (all fragments), 0x02 commit (last packet of this frame).
-///     Unchanged frames are skipped; otherwise only dirty 1440-byte slots are sent, with a keyframe
-///     at least every second (or when more than half the slots changed). Full (key) frames are paced
-///     only by TargetMbps — no extra inter-frame gap, that crushed fps on video.
+    ///     Unchanged frames are skipped; otherwise only dirty 1440-byte slots are sent, with a keyframe
+    ///     at least every second for loss recovery. High-motion frames stay deltas (a &gt;50% dirty
+    ///     key used to double video bitrate). Full (key) frames are paced only by TargetMbps — no extra
+    ///     inter-frame gap, that crushed fps on video.
 ///     Geometry: landscape 256x128 -&gt; stacked 128x256 (rot_cw + flip_x + flip_y), 4 data groups.
 ///     Colour + seam are live-adjustable (UpdateColor / UpdateSeam).
 /// </summary>
@@ -378,12 +379,9 @@ public sealed class PanelStreamer : IDisposable
         }
 
         var dueKey = !_havePrev || now - _lastKeySec >= KeyframeSec;
-        if (nChanged == 0)
-        {
-            if (!dueKey || !_dirtySinceKey) return;
-        }
+        if (!PackedSendPolicy.TrySend(_havePrev, dueKey, nChanged, _dirtySinceKey, out var key))
+            return;
 
-        var key = !_havePrev || dueKey || nChanged * 2 >= _nFrags || nChanged == 0;
         var nThis = key ? _nFrags : nChanged;
 
         SendPaced(key, nThis);
@@ -436,6 +434,20 @@ public sealed class PanelStreamer : IDisposable
             while (_sw.Elapsed.TotalSeconds < deadline)
             {
             } // fine busy-wait
+        }
+
+        // High-motion dirty sends used to finish in 20ms then the next took 90ms — that cadence
+        // stutter is worse than a steady ~full-keyframe rate. Pad to a full buf16 slot whenever
+        // this frame already used at least half the link budget (video). Sparse UI frames stay snappy.
+        if (frameBytes * 2 >= _buf16Bytes)
+        {
+            var slot = frameStart + _buf16Bytes * 8.0 / _bps;
+            var pad = slot - _sw.Elapsed.TotalSeconds;
+            if (pad > 0.0005)
+                Thread.Sleep((int)((pad - 0.0003) * 1000));
+            while (_sw.Elapsed.TotalSeconds < slot)
+            {
+            }
         }
     }
 }
