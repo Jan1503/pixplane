@@ -34,7 +34,8 @@ public sealed class PanelStreamer : IDisposable
         15, 7, 13, 5
     };
 
-    private readonly double _bps;
+    private double _bps;          // current pacing (adapts when the panel acknowledges frames)
+    private readonly double _bpsMax;
     private readonly byte[] _buf16;
     private readonly int _buf16Bytes;
 
@@ -90,6 +91,9 @@ public sealed class PanelStreamer : IDisposable
         _host = string.IsNullOrWhiteSpace(opt.Host) ? "192.168.10.181" : opt.Host;
         _port = opt.Port > 0 ? opt.Port : 7777;
         _bps = (opt.TargetMbps > 0 ? opt.TargetMbps : 19.0) * 1_000_000.0;
+        _bpsMax = Math.Max(_bps, (opt.MaxMbps > 0 ? opt.MaxMbps : 95.0) * 1_000_000.0);
+        _bpsFloor = _bps * 0.5;
+        _adaptive = opt.AdaptivePacing;
         _nPlanes = opt.ColorBits switch { 10 => 10, 13 => 13, 14 => 14, _ => 8 };
         _maxVal = (1 << _nPlanes) - 1;
 
@@ -396,6 +400,7 @@ public sealed class PanelStreamer : IDisposable
     {
         if (!_online || _sock == null) return;
         if (strideBytes < Width * 4) throw new ArgumentException("stride too small", nameof(strideBytes));
+        WaitForAck();
         if (bgra.Length < strideBytes * (Height - 1) + Width * 4)
             throw new ArgumentException("frame buffer too small", nameof(bgra));
 
@@ -512,7 +517,10 @@ public sealed class PanelStreamer : IDisposable
 
         // The panel asks for a key (VPXD 0x03) when it lost a delta: until a key arrives, the slots
         // that delta changed would keep showing old pixels.
-        var keyRequested = PollKeyRequest();
+        PollFeedback(0);
+        var keyRequested = _keyPending;
+        _keyPending = false;
+        if (keyRequested) SlowDown();
         var dueKey = !_havePrev || keyRequested || now - _lastKeySec >= KeyframeSec;
         bool key;
         if (keyRequested)
@@ -522,7 +530,7 @@ public sealed class PanelStreamer : IDisposable
 
         var nThis = key ? _nFrags : nChanged;
 
-        SendPaced(key, nThis);
+        _awaitId = SendPaced(key, nThis);
         Buffer.BlockCopy(_buf16, 0, _prev, 0, _buf16Bytes);
         _havePrev = true;
         if (key)
@@ -541,21 +549,145 @@ public sealed class PanelStreamer : IDisposable
     /// <summary>Key-frame requests received from the panel (each one answered with a key).</summary>
     public long KeyRequests { get; private set; }
 
-    /// <summary>True when the panel sent a key-frame request since the last frame (non-blocking).</summary>
-    private bool PollKeyRequest()
+    /// <summary>Frames the panel acknowledged (firmware 1.11+ flow control).</summary>
+    public long Acks { get; private set; }
+
+    /// <summary>Frames sent without an acknowledgement within <see cref="AckTimeoutMs"/>.</summary>
+    public long AckTimeouts { get; private set; }
+
+    /// <summary>Current pacing in Mbit/s (starts at TargetMbps, adapts between 10 and MaxMbps).</summary>
+    public double CurrentMbps => _bps / 1_000_000.0;
+
+    /// <summary>True while the panel acknowledges frames (flow control active).</summary>
+    public bool FlowControl => _ackSeen;
+
+    // After the last datagram the panel needs at most ~2.5 ms correction + ~8.4 ms upload wait before it
+    // acks; 30 ms covers that with room for the network and keeps a lost frame from stalling the video.
+    private const int AckTimeoutMs = 30;
+    private const double CeilProbeSec = 60.0;   // time without a cut before the learned ceiling may rise
+    private const double LossWindowSec = 10.0;  // a cut needs LossesForCut losses within this window
+    private const int LossesForCut = 3;
+    private double _bpsCeil = double.MaxValue;  // learned pacing ceiling
+    private double _lastCutSec;
+    private readonly Queue<double> _losses = new();
+    private double _bpsFloor;
+    private readonly bool _adaptive;
+    private const double MinBps = 10_000_000.0;
+    private int _awaitId = -1;     // frame id waiting for its ack, -1 = none
+    private int _lastAckId = -1;
+    private bool _ackSeen;
+    private int _ackMisses;
+    private bool _keyPending;
+
+    /// <summary>
+    ///     Flow control: firmware 1.11+ acknowledges every frame it has taken over (VPXD 0x04 id). The
+    ///     next frame is only sent after that, so it never arrives while the panel still waits for an
+    ///     upload (which overflowed its 16 KB socket buffer and dropped the frame). Each panel has its own
+    ///     streamer and pump thread, so a slow panel only skips its own frames. Until the first ack is
+    ///     seen (older firmware) nothing waits.
+    /// </summary>
+    /// <summary>
+    ///     Wait until the panel acknowledged the previous frame. Call it before taking the next frame
+    ///     from the source, so the freshest frame goes out (SendFrameBgra calls it too).
+    /// </summary>
+    public void WaitReady() => WaitForAck();
+
+    private void WaitForAck()
+    {
+        if (_awaitId < 0) return;
+        if (!_ackSeen)
+        {
+            PollFeedback(0);
+            if (!_ackSeen) return;
+        }
+
+        var until = _sw.Elapsed.TotalMilliseconds + AckTimeoutMs;
+        while (_lastAckId != _awaitId)
+        {
+            var left = until - _sw.Elapsed.TotalMilliseconds;
+            if (left <= 0)
+            {
+                // no ack: the frame may be lost, so the next one goes out as a key (even if nothing changed)
+                AckTimeouts++;
+                _keyPending = true;
+                SlowDown();
+                if (++_ackMisses >= 10)
+                {
+                    _ackSeen = false;   // panel stopped acknowledging (older firmware, test mode): stop waiting
+                    _ackMisses = 0;
+                }
+
+                break;
+            }
+
+            PollFeedback((int)Math.Ceiling(left));
+        }
+
+        if (_lastAckId == _awaitId)
+        {
+            _ackMisses = 0;
+            SpeedUp();
+        }
+
+        _awaitId = -1;
+    }
+
+    // Pacing: rise towards the ceiling; lower the ceiling only when losses pile up. Measured with a
+    // 24 fps source (all slots changing): up to ~75 Mbit/s the panel loses a frame every 15-30 s no
+    // matter the rate, above ~80 the losses rise steeply. Lowering the rate on every single loss
+    // ratcheted it down to ~44 Mbit/s, too slow for 24 fps; probing up again after each loss cost a
+    // frame every ~2 s (visible micro stutter). So: cut by 8 % after 3 losses within 10 s, and let the
+    // ceiling rise by 1 Mbit/s only after 60 s without a cut.
+    private void SpeedUp()
+    {
+        if (!_adaptive) return;
+        var now = _sw.Elapsed.TotalSeconds;
+        if (_bpsCeil < _bpsMax && now - _lastCutSec >= CeilProbeSec)
+        {
+            _bpsCeil = Math.Min(_bpsMax, _bpsCeil + 1_000_000.0);
+            _lastCutSec = now;
+        }
+
+        _bps = Math.Min(Math.Min(_bpsMax, _bpsCeil), _bps + 500_000.0);
+    }
+
+    private void SlowDown()
+    {
+        if (!_ackSeen || !_adaptive) return;
+        var now = _sw.Elapsed.TotalSeconds;
+        _losses.Enqueue(now);
+        while (_losses.Count > 0 && now - _losses.Peek() > LossWindowSec) _losses.Dequeue();
+        if (_losses.Count < LossesForCut) return;
+        _losses.Clear();
+        _bpsCeil = Math.Max(Math.Max(MinBps, _bpsFloor), Math.Min(_bpsCeil, _bps) * 0.92);
+        _bps = _bpsCeil;
+        _lastCutSec = now;
+    }
+
+    /// <summary>Read panel feedback (acks, key requests); waits up to <paramref name="waitMs"/> for the first datagram.</summary>
+    private void PollFeedback(int waitMs)
     {
         var sock = _sock;
-        if (sock == null) return false;
-        var req = false;
+        if (sock == null) return;
         try
         {
+            if (sock.Available == 0 && (waitMs <= 0 || !sock.Poll(waitMs * 1000, SelectMode.SelectRead)))
+                return;
             while (sock.Available > 0)
             {
                 var n = sock.Receive(_rx);
-                if (n >= 5 && _rx[0] == (byte)'V' && _rx[1] == (byte)'P' && _rx[2] == (byte)'X' && _rx[3] == (byte)'D' && _rx[4] == 0x03)
+                if (n < 5 || _rx[0] != (byte)'V' || _rx[1] != (byte)'P' || _rx[2] != (byte)'X' || _rx[3] != (byte)'D')
+                    continue;
+                if (_rx[4] == 0x03)
                 {
-                    req = true;
+                    _keyPending = true;
                     KeyRequests++;
+                }
+                else if (_rx[4] == 0x04 && n >= 6)
+                {
+                    _lastAckId = _rx[5];
+                    _ackSeen = true;
+                    Acks++;
                 }
             }
         }
@@ -566,11 +698,9 @@ public sealed class PanelStreamer : IDisposable
         {
             // e.g. ICMP port unreachable reported on a connected UDP socket
         }
-
-        return req;
     }
 
-    private void SendPaced(bool key, int nThis)
+    private int SendPaced(bool key, int nThis)
     {
         var id = _frameId++;
         var frameStart = _sw.Elapsed.TotalSeconds;
@@ -590,23 +720,31 @@ public sealed class PanelStreamer : IDisposable
             dg[3] = (byte)((key ? FlagKey : 0) | (sent == nThis ? FlagCommit : 0));
             Buffer.BlockCopy(_buf16, off, dg, 4, len);
             var sock = _sock;
-            if (!_online || sock == null) return;
+            if (!_online || sock == null) return -1;
             try
             {
                 sock.Send(dg, 0, 4 + len, SocketFlags.None);
             }
             catch (ObjectDisposedException)
             {
-                return;
+                return -1;
             }
             catch (SocketException)
             {
-                return;
+                return -1;
             }
 
             frameBytes += 4 + len;
             var deadline = frameStart + frameBytes * 8.0 / _bps;
             var wait = deadline - _sw.Elapsed.TotalSeconds;
+            if (wait < -0.0005)
+            {
+                // Behind schedule (thread preempted, GC, ...): do not catch up. Catching up sent the
+                // following datagrams back to back at line rate, which overflowed the panel's 16 KB
+                // socket buffer (W6300) and lost the frame. Shift the schedule instead.
+                frameStart -= wait;
+                wait = 0;
+            }
             if (wait > 0.0005)
                 Thread.Sleep((int)((wait - 0.0003) * 1000)); // coarse
             while (_sw.Elapsed.TotalSeconds < deadline)
@@ -617,7 +755,8 @@ public sealed class PanelStreamer : IDisposable
         // High-motion dirty sends used to finish in 20ms then the next took 90ms — that cadence
         // stutter is worse than a steady ~full-keyframe rate. Pad to a full buf16 slot whenever
         // this frame already used at least half the link budget (video). Sparse UI frames stay snappy.
-        if (frameBytes * 2 >= _buf16Bytes)
+        // With flow control the panel's ack sets the cadence; padding would only cost frames.
+        if (!_ackSeen && frameBytes * 2 >= _buf16Bytes)
         {
             var slot = frameStart + _buf16Bytes * 8.0 / _bps;
             var pad = slot - _sw.Elapsed.TotalSeconds;
@@ -627,5 +766,7 @@ public sealed class PanelStreamer : IDisposable
             {
             }
         }
+
+        return id;
     }
 }

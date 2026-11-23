@@ -186,6 +186,15 @@ public sealed class PanelStreamOptions
     /// <summary>Send pacing target in Mbit/s (kept just below the MCU's drain rate to avoid RX overflow).</summary>
     public double TargetMbps { get; set; } = 19.0;
 
+    /// <summary>
+    ///     Upper limit for the adaptive pacing. With firmware 1.11+ the panel acknowledges every frame and
+    ///     PixPlane raises the pacing from TargetMbps towards this until frames get lost, then backs off.
+    /// </summary>
+    public double MaxMbps { get; set; } = 95.0;
+
+    /// <summary>Adapt the pacing to the panel's acks (default). False keeps TargetMbps fixed.</summary>
+    public bool AdaptivePacing { get; set; } = true;
+
     /// <summary>Greyscale bit-planes sent: 8, 10, 13 or 14. Must match the firmware's HUB_NPLANES / gclk bits.</summary>
     public int ColorBits { get; set; } = 14;
 
