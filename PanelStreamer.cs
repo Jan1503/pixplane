@@ -53,8 +53,11 @@ public sealed class PanelStreamer : IDisposable
     private readonly int _nPlanes;
     private readonly int _port;
 
-    private readonly Socket _sock;
+    private Socket? _sock;
     private readonly Stopwatch _sw = new();
+    private readonly Thread _watch;
+    private int _disposed;
+    private volatile bool _online = true;
     private volatile bool _dither = true;
     private byte _frameId;
     private ushort[] _lutB = new ushort[256];
@@ -122,9 +125,14 @@ public sealed class PanelStreamer : IDisposable
         UpdateColor(opt.Color ?? new PanelColorSettings());
         UpdateSeam(opt.Seam ?? []);
 
-        _sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        _sock.Connect(new IPEndPoint(IPAddress.Parse(_host), _port)); // "connect" UDP -> Send()
+        OpenSocket();
         _sw.Restart();
+        _watch = new Thread(WatchLoop)
+        {
+            IsBackground = true,
+            Name = "pixplane-watch-" + _host
+        };
+        _watch.Start();
     }
 
     public int Width { get; }
@@ -132,7 +140,130 @@ public sealed class PanelStreamer : IDisposable
 
     public void Dispose()
     {
-        _sock.Dispose();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        _online = false;
+        DropSocket();
+        try { _watch.Join(2000); } catch (Exception) { }
+    }
+
+    /// <summary>
+    ///     Video UDP stays blocking and paced. A second socket asks the panel on port 7778.
+    ///     Two missed replies close the video socket, so a pulled cable cannot keep filling the
+    ///     shared NIC queue. The socket is reopened when the panel answers again.
+    /// </summary>
+    private void WatchLoop()
+    {
+        var misses = 0;
+        var proven = false;
+        while (Volatile.Read(ref _disposed) == 0)
+        {
+            var ok = false;
+            try { ok = ProbeOnce(); }
+            catch (Exception) { ok = false; }
+            if (Volatile.Read(ref _disposed) != 0) return;
+
+            if (ok)
+            {
+                misses = 0;
+                if (!proven)
+                    proven = true;
+                if (!_online)
+                {
+                    try
+                    {
+                        OpenSocket();
+                        _online = true;
+                        Console.WriteLine($"[PIX] {_host} answering again, stream resumed");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[PIX] {_host} socket reopen failed: {ex.Message}");
+                    }
+                }
+
+                Thread.Sleep(400);
+                continue;
+            }
+
+            if (!proven)
+            {
+                Thread.Sleep(400);
+                continue;
+            }
+
+            misses++;
+            if (_online && misses >= 2)
+            {
+                _online = false;
+                _havePrev = false;
+                DropSocket();
+                Console.WriteLine($"[PIX] {_host} not answering, this panel is paused");
+            }
+
+            Thread.Sleep(_online ? 50 : 400);
+        }
+    }
+
+    private bool ProbeOnce()
+    {
+        using var probe = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        probe.Blocking = false;
+        var dest = new IPEndPoint(IPAddress.Parse(_host), 7778);
+        var pkt = new byte[] { (byte)'V', (byte)'P', (byte)'X', (byte)'D', 0x01 };
+        try
+        {
+            probe.SendTo(pkt, dest);
+        }
+        catch (SocketException ex) when (ex.SocketErrorCode == SocketError.WouldBlock)
+        {
+            if (!probe.Poll(30_000, SelectMode.SelectWrite)) return false;
+            try { probe.SendTo(pkt, dest); }
+            catch (SocketException) { return false; }
+        }
+        catch (SocketException)
+        {
+            return false;
+        }
+
+        var buf = new byte[128];
+        var until = Environment.TickCount64 + 350;
+        while (Environment.TickCount64 < until && Volatile.Read(ref _disposed) == 0)
+        {
+            if (!probe.Poll(20_000, SelectMode.SelectRead)) continue;
+            try
+            {
+                var n = probe.Receive(buf);
+                if (n >= 5 && buf[0] == (byte)'V' && buf[1] == (byte)'P' && buf[2] == (byte)'X' && buf[3] == (byte)'D' && buf[4] == 0x02)
+                    return true;
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.WouldBlock)
+            {
+            }
+            catch (SocketException)
+            {
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    private void OpenSocket()
+    {
+        DropSocket();
+        var sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        try { sock.SendBufferSize = 32 * 1024; }
+        catch (SocketException) { }
+        sock.Connect(new IPEndPoint(IPAddress.Parse(_host), _port));
+        _sock = sock;
+    }
+
+    private void DropSocket()
+    {
+        var sock = Interlocked.Exchange(ref _sock, null);
+        if (sock == null) return;
+        try { sock.Dispose(); }
+        catch (Exception) { }
     }
 
     private int[] NewGain()
@@ -263,6 +394,7 @@ public sealed class PanelStreamer : IDisposable
     /// <summary>Pack a top-down BGRA frame (256x128, 4 bytes/pixel) and stream it, paced.</summary>
     public void SendFrameBgra(ReadOnlySpan<byte> bgra, int strideBytes)
     {
+        if (!_online || _sock == null) return;
         if (strideBytes < Width * 4) throw new ArgumentException("stride too small", nameof(strideBytes));
         if (bgra.Length < strideBytes * (Height - 1) + Width * 4)
             throw new ArgumentException("frame buffer too small", nameof(bgra));
@@ -378,8 +510,14 @@ public sealed class PanelStreamer : IDisposable
             }
         }
 
-        var dueKey = !_havePrev || now - _lastKeySec >= KeyframeSec;
-        if (!PackedSendPolicy.TrySend(_havePrev, dueKey, nChanged, _dirtySinceKey, out var key))
+        // The panel asks for a key (VPXD 0x03) when it lost a delta: until a key arrives, the slots
+        // that delta changed would keep showing old pixels.
+        var keyRequested = PollKeyRequest();
+        var dueKey = !_havePrev || keyRequested || now - _lastKeySec >= KeyframeSec;
+        bool key;
+        if (keyRequested)
+            key = true;
+        else if (!PackedSendPolicy.TrySend(_havePrev, dueKey, nChanged, _dirtySinceKey, out key))
             return;
 
         var nThis = key ? _nFrags : nChanged;
@@ -396,6 +534,40 @@ public sealed class PanelStreamer : IDisposable
         {
             _dirtySinceKey = true;
         }
+    }
+
+    private readonly byte[] _rx = new byte[64];
+
+    /// <summary>Key-frame requests received from the panel (each one answered with a key).</summary>
+    public long KeyRequests { get; private set; }
+
+    /// <summary>True when the panel sent a key-frame request since the last frame (non-blocking).</summary>
+    private bool PollKeyRequest()
+    {
+        var sock = _sock;
+        if (sock == null) return false;
+        var req = false;
+        try
+        {
+            while (sock.Available > 0)
+            {
+                var n = sock.Receive(_rx);
+                if (n >= 5 && _rx[0] == (byte)'V' && _rx[1] == (byte)'P' && _rx[2] == (byte)'X' && _rx[3] == (byte)'D' && _rx[4] == 0x03)
+                {
+                    req = true;
+                    KeyRequests++;
+                }
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        catch (SocketException)
+        {
+            // e.g. ICMP port unreachable reported on a connected UDP socket
+        }
+
+        return req;
     }
 
     private void SendPaced(bool key, int nThis)
@@ -417,9 +589,15 @@ public sealed class PanelStreamer : IDisposable
             dg[2] = (byte)nThis;
             dg[3] = (byte)((key ? FlagKey : 0) | (sent == nThis ? FlagCommit : 0));
             Buffer.BlockCopy(_buf16, off, dg, 4, len);
+            var sock = _sock;
+            if (!_online || sock == null) return;
             try
             {
-                _sock.Send(dg, 0, 4 + len, SocketFlags.None);
+                sock.Send(dg, 0, 4 + len, SocketFlags.None);
+            }
+            catch (ObjectDisposedException)
+            {
+                return;
             }
             catch (SocketException)
             {

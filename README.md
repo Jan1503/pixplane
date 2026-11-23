@@ -2,19 +2,19 @@
 
 C# host library for the [verpixeld-panel](https://github.com/Jan1503/verpixeld-panel) firmware (RP2350 + W6300, ICND1065L 256×128). Feed a top-down BGRA frame; PixPlane packs the panel bit-planes and sends paced UDP.
 
-The old working name was `RgbPanel`. The GitHub repository name can be changed later (Settings → General → Rename); old URLs redirect.
-
 Used by [verpixeld](https://github.com/Jan1503/verpixeld) and [DeskCast](https://github.com/Jan1503/deskcast).
 
 ## What it does
 
-| Type | Role |
-|------|------|
-| `PanelStreamer` | BGRA 256×128 → ICND bit-planes → paced UDP (default port 7777) |
-| `PanelControl` | HTTP `/cmd` on the panel web UI (`livemode` live 8/14, or save+reboot) |
-| `PanelDiscovery` | UDP 7778 probe (`VPXD`) plus HTTP `/status` fallback |
-| `PanelColorSettings` | Live gamma / contrast / brightness / white-balance LUT |
-| `SeamColumn` | Per-column 8-bit remap (knots or 256-entry LUT) plus optional gain/lift for the four scan-home columns |
+
+| Type                 | Role                                                                                                   |
+| -------------------- | ------------------------------------------------------------------------------------------------------ |
+| `PanelStreamer`      | BGRA 256×128 → ICND bit-planes → paced UDP (default port 7777)                                         |
+| `PanelControl`       | HTTP `/cmd` on the panel web UI (`livemode` live 8/14, or save+reboot)                                 |
+| `PanelDiscovery`     | UDP 7778 probe (`VPXD`) plus HTTP `/status` fallback                                                   |
+| `PanelColorSettings` | Live gamma / contrast / brightness / white-balance LUT                                                 |
+| `SeamColumn`         | Per-column 8-bit remap (knots or 256-entry LUT) plus optional gain/lift for the four scan-home columns |
+
 
 No UI or graphics dependency. Target framework: `net10.0`.
 
@@ -30,7 +30,7 @@ Decision logic lives in `PackedSendPolicy` (unit-tested from verpixeld).
 
 ## Protocol
 
-Datagram v2 (firmware 1.5+): `[frameId:1][fragIdx:1][nThis:1][flags:1]` + chunk (max 1440 bytes). Fragment n maps to `buf16` offset `n * 1440`. Flags: `0x01` keyframe (all slots), `0x02` commit (last packet of this frame). Unchanged frames are skipped; otherwise only dirty slots are sent, with a keyframe at least every second for loss recovery (high-motion frames stay deltas). Host and panel must be updated together. Colour depth is 8 / 10 / 13 / 14 bit-planes and must match the firmware. Firmware 1.7+ can switch 8/14 live via `livemode` (no reboot).
+Datagram v2 (firmware 1.5+): `[frameId:1][fragIdx:1][nThis:1][flags:1]` + chunk (max 1440 bytes). Fragment n maps to `buf16` offset `n * 1440`. Flags: `0x01` keyframe (all slots), `0x02` commit (last packet of this frame). Unchanged frames are skipped; otherwise only dirty slots are sent, with a keyframe at least every second for loss recovery (high-motion frames stay deltas). Firmware 1.10+ also asks for a key right after a lost delta: it sends `VPXD 0x03` from the stream port back to the sender, and the next frame goes out as a key (`KeyRequests` counts them). Without that, the slots the lost delta changed showed old pixels until the next 1 s key. Host and panel must be updated together. Colour depth is 8 / 10 / 13 / 14 bit-planes and must match the firmware. Firmware 1.7+ can switch 8/14 live via `livemode` (no reboot).
 
 ## Scan-home seam correction
 
@@ -49,19 +49,22 @@ PixPlane therefore remaps the 8-bit source **on those columns only**, before the
 
 `SeamColumn` fields:
 
-| Field | Meaning |
-|-------|---------|
-| `X` | Logical column (0..255). Defaults in the hosts: 63 / 127 / 191 / 255 |
-| `Knots` | 8-bit in→out points (typical UI: 9 knots at 0, 32, …, 255). Linearly interpolated to 256 |
+
+| Field                            | Meaning                                                                                                           |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `X`                              | Logical column (0..255). Defaults in the hosts: 63 / 127 / 191 / 255                                              |
+| `Knots`                          | 8-bit in→out points (typical UI: 9 knots at 0, 32, …, 255). Linearly interpolated to 256                          |
 | `Lut` / `LutR` / `LutG` / `LutB` | Optional explicit 256-entry arrays (JSON numbers 0..255, not base64). Per-channel arrays override `Lut` / `Knots` |
-| `GainR/G/B`, `LiftR/G/B` | Optional affine term **after** the remap. Old JSON with only gain/lift still works (remap is identity) |
+| `GainR/G/B`, `LiftR/G/B`         | Optional affine term **after** the remap. Old JSON with only gain/lift still works (remap is identity)            |
+
 
 `PanelStreamer.UpdateSeam(...)` rebuilds the maps live. Identity remaps take the fast path (no per-pixel lookup). The four columns usually share one curve because they are the same scan-home line.
 
 Matching is done with a **host-generated grey fill** (verpixeld Settings → Seam → Wall grey). Firmware test patterns (`t f`) bypass this packer, so they cannot calibrate the curve.
 
-<!-- PHOTO seam-uncorrected: grey ramp, four mismatched columns at 63/127/191/255 -->
-<!-- PHOTO seam-corrected: same frame after the 9-point curve -->
+
+
+
 
 UI and JSON live in the hosts: [verpixeld](https://github.com/Jan1503/verpixeld) (`seam_correction.json` with separate 8- and 14-bit profiles, `/api/settings/seam`) and [DeskCast](https://github.com/Jan1503/deskcast) (single-curve Seam window).
 
@@ -118,6 +121,8 @@ Discover panels on the LAN:
 var panels = await PanelDiscovery.ScanAsync();
 ```
 
+
+
 ## Build
 
 ```bash
@@ -136,6 +141,8 @@ PanelControl.cs          HTTP /cmd (livemode / mode+reboot)
 PanelDiscovery.cs        UDP 7778 + HTTP /status
 PanelStreamOptions.cs    Colour / seam / stream settings
 ```
+
+
 
 ## License
 
